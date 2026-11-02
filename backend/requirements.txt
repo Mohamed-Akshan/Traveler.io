@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-dotenv
+
+# LangGraph workflow and PostgreSQL checkpoint memory
+langgraph
+langgraph-checkpoint-postgres
+langchain-core
+
+langchain-google-genai
+langchain-groq
+
+psycopg[binary,pool]
+tavily-python
+requests
