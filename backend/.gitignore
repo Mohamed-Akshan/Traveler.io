@@ -14,3 +14,4 @@ htmlcov/
 .vscode/
 *.log
 .DS_Store
+.chat_memory.json

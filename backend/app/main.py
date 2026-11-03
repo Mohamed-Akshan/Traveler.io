@@ -1,6 +1,7 @@
 
 """FastAPI routes for chat, travel planning, and human approval."""
 
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -55,17 +56,49 @@ app.add_middleware(
 # Kept outside LangGraph on purpose: writing messages into graph state with
 # as_node="final_agent" schedules the approval node and makes every later
 # message on that thread hit the "pending itinerary" early-return.
-CHAT_MEMORY: dict[str, list[str]] = {}
+# Persisted to disk so restarts/reloads never lose the conversation context.
+import json as _json
+from pathlib import Path as _Path
+
+MEMORY_FILE = _Path(__file__).resolve().parents[1] / ".chat_memory.json"
+
+
+def _load_memory() -> dict:
+    try:
+        data = _json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+CHAT_MEMORY: dict[str, list[str]] = _load_memory()
 
 
 def remember(thread_id: str, line: str, limit: int = 24) -> None:
     bucket = CHAT_MEMORY.setdefault(thread_id, [])
     bucket.append(line)
     del bucket[:-limit]
+    try:
+        MEMORY_FILE.write_text(
+            _json.dumps(CHAT_MEMORY, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
 
 def recall(thread_id: str) -> str:
     return "\n".join(CHAT_MEMORY.get(thread_id, []))
+
+
+# Short consents like "yes sure" — only these can trigger the planner from chat.
+AFFIRMATIVE = re.compile(
+    r"^(?:yes|yep|yeah|ya|sure|ok|okay|fine|good|great|perfect|nice|"
+    r"please do|go ahead|sounds good|looks good|that works|"
+    r"yes (?:please|sure|go ahead|do)|sure (?:thing|lets|let'?s)|"
+    r"(?:yes|sure)[,!.]?\s*(?:please|sure|go ahead)?)[.!]*$",
+    re.IGNORECASE,
+)
 
 
 # Data received from React chat
@@ -122,34 +155,64 @@ def chat(body: ChatInput):
                 "plan": snapshot.values.get("plan_data", {}),
             }
 
+        history = recall(body.thread_id)
+        check = None
+
         # Normal buddy-style conversation
         if body.mode != "plan":
 
-            history = recall(body.thread_id)
+            message = body.message.strip()
 
-            # Ask Gemini, using Groq as fallback
-            answer = ask_llm(
-                prompts.CHAT,
-                f"Conversation:\n{history}\n\nUser: {body.message}",
+            # A short "yes, sure" once the details are already in the chat must
+            # start the planner — not repeat the list of details back.
+            if len(message) <= 60 and AFFIRMATIVE.match(message):
+                check = read_json(
+                    ask_llm(
+                        prompts.CLARIFY,
+                        f"Conversation:\n{history}\n\nUser reply:\n{message}",
+                    )
+                )
+
+                if not check.get("ready"):
+                    reply = str(
+                        check.get("reply")
+                        or "Almost there — I just need the travel dates, number of days, and how many travellers are joining."
+                    )
+                    remember(body.thread_id, f"user: {message}")
+                    remember(body.thread_id, f"assistant: {reply}")
+
+                    return {
+                        "status": "clarify",
+                        "reply": reply,
+                        "missing": check.get("missing", []),
+                    }
+
+                remember(body.thread_id, f"user: {message}")
+
+            else:
+                # Ask Gemini, using Groq as fallback
+                answer = ask_llm(
+                    prompts.CHAT,
+                    f"Conversation:\n{history}\n\nUser: {body.message}",
+                )
+
+                remember(body.thread_id, f"user: {body.message}")
+                remember(body.thread_id, f"assistant: {answer}")
+
+                return {
+                    "status": "chat",
+                    "reply": answer,
+                }
+
+        # Plan mode (or a confirmed affirmative): ask for missing essentials
+        # ONCE before running the agents.
+        if check is None:
+            check = read_json(
+                ask_llm(
+                    prompts.CLARIFY,
+                    f"Conversation:\n{history}\n\nPlan request:\n{body.message}",
+                )
             )
-
-            remember(body.thread_id, f"user: {body.message}")
-            remember(body.thread_id, f"assistant: {answer}")
-
-            return {
-                "status": "chat",
-                "reply": answer,
-            }
-
-        # Plan mode: ask for missing essentials ONCE before running the agents.
-        history = recall(body.thread_id)
-
-        check = read_json(
-            ask_llm(
-                prompts.CLARIFY,
-                f"Conversation:\n{history}\n\nPlan request:\n{body.message}",
-            )
-        )
 
         if not check.get("ready"):
             reply = str(
@@ -167,12 +230,20 @@ def chat(body: ChatInput):
                 "missing": check.get("missing", []),
             }
 
+        # Details said earlier in the chat (destination, dates, days, people)
+        # must reach the planner — not just the final "yes sure".
+        planner_query = (
+            f"Conversation so far:\n{history}\n\nLatest message: {body.message}"
+            if history
+            else body.message
+        )
+
         # Starting state for the multi-agent travel planner
         initial_state = {
             "messages": [
-                HumanMessage(content=body.message)
+                HumanMessage(content=planner_query)
             ],
-            "user_query": body.message,
+            "user_query": planner_query,
             "selected_agents": [],
             "trip_constraints": {},
             "flight_results": "",
